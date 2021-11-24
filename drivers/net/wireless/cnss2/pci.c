@@ -43,6 +43,7 @@
 #define DEFAULT_FW_FILE_NAME		"amss.bin"
 #define FW_V2_FILE_NAME			"amss20.bin"
 #define FW_V2_NUMBER			2
+#define DEVICE_MAJOR_VERSION_MASK	0xF
 
 #define WAKE_MSI_NAME			"WAKE"
 
@@ -743,6 +744,9 @@ int cnss_suspend_pci_link(struct cnss_pci_data *pci_priv)
 			cnss_pr_err("Failed to set D3Hot, err =  %d\n", ret);
 	}
 
+	/* Always do PCIe L2 suspend during power off/PCIe link recovery */
+	pci_priv->drv_connected_last = 0;
+
 	ret = cnss_set_pci_link(pci_priv, PCI_LINK_DOWN);
 	if (ret)
 		goto out;
@@ -886,6 +890,17 @@ void cnss_pci_allow_l1(struct device *dev)
 }
 EXPORT_SYMBOL(cnss_pci_allow_l1);
 
+static void cnss_pci_update_link_event(struct cnss_pci_data *pci_priv,
+				       enum cnss_bus_event_type type,
+				       void *data)
+{
+	struct cnss_bus_event bus_event;
+
+	bus_event.etype = type;
+	bus_event.event_data = data;
+	cnss_pci_call_driver_uevent(pci_priv, CNSS_BUS_EVENT, &bus_event);
+}
+
 static void cnss_pci_handle_linkdown(struct cnss_pci_data *pci_priv)
 {
 	struct cnss_plat_data *plat_priv = pci_priv->plat_priv;
@@ -907,8 +922,17 @@ static void cnss_pci_handle_linkdown(struct cnss_pci_data *pci_priv)
 
 	reinit_completion(&pci_priv->wake_event);
 
+	/* Notify MHI about link down */
+	mhi_control_error(pci_priv->mhi_ctrl);
+
 	if (pci_dev->device == QCA6174_DEVICE_ID)
 		disable_irq(pci_dev->irq);
+
+	/* Notify bus related event. Now for all supported chips.
+	 * Here PCIe LINK_DOWN notification taken care.
+	 * uevent buffer can be extended later, to cover more bus info.
+	 */
+	cnss_pci_update_link_event(pci_priv, BUS_EVENT_PCI_LINK_DOWN, NULL);
 
 	cnss_fatal_err("PCI link down, schedule recovery\n");
 	cnss_schedule_recovery(&pci_dev->dev, CNSS_REASON_LINK_DOWN);
@@ -1858,9 +1882,9 @@ static void cnss_pci_dump_qca6390_sram_mem(struct cnss_pci_data *pci_priv)
 	sbl_log_size = (sbl_log_size > QCA6390_DEBUG_SBL_LOG_SRAM_MAX_SIZE ?
 			QCA6390_DEBUG_SBL_LOG_SRAM_MAX_SIZE : sbl_log_size);
 
-	if (sbl_log_start < QCA6390_V2_SBL_DATA_START ||
-	    sbl_log_start > QCA6390_V2_SBL_DATA_END ||
-	    (sbl_log_start + sbl_log_size) > QCA6390_V2_SBL_DATA_END)
+	if (sbl_log_start < SRAM_START ||
+	    sbl_log_start > SRAM_END ||
+	    (sbl_log_start + sbl_log_size) > SRAM_END)
 		goto out;
 
 	cnss_pr_dbg("Dumping SBL log data\n");
@@ -1928,17 +1952,11 @@ static void cnss_pci_dump_bl_sram_mem(struct cnss_pci_data *pci_priv)
 
 	sbl_log_size = (sbl_log_size > QCA6490_DEBUG_SBL_LOG_SRAM_MAX_SIZE ?
 			QCA6490_DEBUG_SBL_LOG_SRAM_MAX_SIZE : sbl_log_size);
-	if (plat_priv->device_version.major_version == FW_V2_NUMBER) {
-		if (sbl_log_start < QCA6490_V2_SBL_DATA_START ||
-		    sbl_log_start > QCA6490_V2_SBL_DATA_END ||
-		    (sbl_log_start + sbl_log_size) > QCA6490_V2_SBL_DATA_END)
-			goto out;
-	} else {
-		if (sbl_log_start < QCA6490_V1_SBL_DATA_START ||
-		    sbl_log_start > QCA6490_V1_SBL_DATA_END ||
-		    (sbl_log_start + sbl_log_size) > QCA6490_V1_SBL_DATA_END)
-			goto out;
-	}
+
+	if (sbl_log_start < SRAM_START ||
+	    sbl_log_start > SRAM_END ||
+	    (sbl_log_start + sbl_log_size) > SRAM_END)
+		goto out;
 
 	cnss_pr_dbg("Dumping SBL log data");
 	for (i = 0; i < sbl_log_size; i += sizeof(val)) {
@@ -2034,7 +2052,7 @@ static int cnss_qca6290_powerup(struct cnss_pci_data *pci_priv)
 	int ret = 0;
 	struct cnss_plat_data *plat_priv = pci_priv->plat_priv;
 	unsigned int timeout;
-	int retry = 0;
+	int retry = 0, sw_ctrl_gpio = plat_priv->pinctrl_info.sw_ctrl_gpio;
 
 	if (plat_priv->ramdump_info_v2.dump_data_valid) {
 		cnss_pci_clear_dump_info(pci_priv);
@@ -2051,6 +2069,8 @@ retry:
 
 	ret = cnss_resume_pci_link(pci_priv);
 	if (ret) {
+		cnss_pr_dbg("Value of SW_CNTRL GPIO: %d\n",
+			    cnss_get_gpio_value(plat_priv, sw_ctrl_gpio));
 		cnss_pr_err("Failed to resume PCI link, err = %d\n", ret);
 		if (test_bit(IGNORE_PCI_LINK_FAILURE,
 			     &plat_priv->ctrl_params.quirks)) {
@@ -2061,6 +2081,9 @@ retry:
 		if (ret == -EAGAIN && retry++ < POWER_ON_RETRY_MAX_TIMES) {
 			cnss_power_off_device(plat_priv);
 			cnss_pr_dbg("Retry to resume PCI link #%d\n", retry);
+			cnss_pr_dbg("Value of SW_CNTRL GPIO: %d\n",
+				    cnss_get_gpio_value(plat_priv,
+							sw_ctrl_gpio));
 			msleep(POWER_ON_RETRY_DELAY_MS * retry);
 			goto retry;
 		}
@@ -3377,8 +3400,7 @@ int cnss_pci_alloc_fw_mem(struct cnss_pci_data *pci_priv)
 			if (!fw_mem[i].va) {
 				cnss_pr_err("Failed to allocate memory for FW, size: 0x%zx, type: %u\n",
 					    fw_mem[i].size, fw_mem[i].type);
-
-				return -ENOMEM;
+				BUG();
 			}
 		}
 	}
@@ -4237,8 +4259,8 @@ static void cnss_pci_remove_dump_seg(struct cnss_pci_data *pci_priv,
 	cnss_minidump_remove_region(plat_priv, type, seg_no, va, pa, size);
 }
 
-int cnss_call_driver_uevent(struct cnss_pci_data *pci_priv,
-			    enum cnss_driver_status status, void *data)
+int cnss_pci_call_driver_uevent(struct cnss_pci_data *pci_priv,
+				enum cnss_driver_status status, void *data)
 {
 	struct cnss_uevent_data uevent_data;
 	struct cnss_wlan_driver *driver_ops;
@@ -4298,7 +4320,7 @@ static void cnss_pci_send_hang_event(struct cnss_pci_data *pci_priv)
 		}
 	}
 
-	cnss_call_driver_uevent(pci_priv, CNSS_HANG_EVENT, &hang_event);
+	cnss_pci_call_driver_uevent(pci_priv, CNSS_HANG_EVENT, &hang_event);
 
 	kfree(hang_event.hang_event_data);
 	hang_event.hang_event_data = NULL;
@@ -4506,6 +4528,9 @@ static int cnss_pci_update_fw_name(struct cnss_pci_data *pci_priv)
 		    plat_priv->device_version.device_number,
 		    plat_priv->device_version.major_version,
 		    plat_priv->device_version.minor_version);
+
+	/* Only keep lower 4 bits as real device major version */
+	plat_priv->device_version.major_version &= DEVICE_MAJOR_VERSION_MASK;
 
 	switch (pci_priv->device_id) {
 	case QCA6390_DEVICE_ID:
