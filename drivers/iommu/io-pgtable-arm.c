@@ -89,6 +89,8 @@
 #define ARM_LPAE_PTE_TYPE_TABLE		3
 #define ARM_LPAE_PTE_TYPE_PAGE		3
 
+#define ARM_LPAE_PTE_ADDR_MASK		GENMASK_ULL(47,12)
+
 #define ARM_LPAE_PTE_SH_MASK		(((arm_lpae_iopte)0x3) << 8)
 #define ARM_LPAE_PTE_NSTABLE		(((arm_lpae_iopte)1) << 63)
 #define ARM_LPAE_PTE_XN			(((arm_lpae_iopte)3) << 53)
@@ -285,6 +287,27 @@ static void iopte_tblcnt_add(arm_lpae_iopte *table_ptep, int cnt)
 
 	current_cnt += cnt;
 	iopte_tblcnt_set(table_ptep, current_cnt);
+}
+
+static arm_lpae_iopte paddr_to_iopte(phys_addr_t paddr,
+				     struct arm_lpae_io_pgtable *data)
+{
+	arm_lpae_iopte pte = paddr;
+
+	/* Of the bits which overlap, either 51:48 or 15:12 are always RES0 */
+	return (pte | (pte >> (48 - 12))) & ARM_LPAE_PTE_ADDR_MASK;
+}
+
+static __maybe_unused phys_addr_t iopte_to_paddr(arm_lpae_iopte pte,
+				  struct arm_lpae_io_pgtable *data)
+{
+	u64 paddr = pte & ARM_LPAE_PTE_ADDR_MASK;
+
+	if (ARM_LPAE_GRANULE(data) < SZ_64K)
+		return paddr;
+
+	/* Rotate the packed high-order bits back to the top */
+	return (paddr | (paddr << (48 - 12))) & (ARM_LPAE_PTE_ADDR_MASK << 4);
 }
 
 static bool selftest_running = false;
